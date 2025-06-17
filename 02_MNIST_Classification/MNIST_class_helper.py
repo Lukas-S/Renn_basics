@@ -2499,7 +2499,7 @@ def visualize_layer_sizes(model, input_size=(1, 1, 28, 28)):
     print(f"Classifier hidden: {classifier_size}")
     print(f"Total size: {total_size}")
 
-def compare_reduction_distances(results_full, results_pca, results_vae, normalize=True):
+def compare_reduction_distances(results_full, results_pca, results_vae, results_importance=None, normalize=True):
     """
     Compare activation-based distances across different dimension reduction methods
     
@@ -2511,6 +2511,8 @@ def compare_reduction_distances(results_full, results_pca, results_vae, normaliz
         Results from analyze_multiple_samples with PCA reduction
     results_vae : dict
         Results from analyze_multiple_samples with VAE reduction
+    results_importance : dict, optional
+        Results from analyze_multiple_samples with importance-based reduction
     normalize : bool, default=True
         Whether to normalize distances to [0,1] range across all distances
     """
@@ -2528,6 +2530,10 @@ def compare_reduction_distances(results_full, results_pca, results_vae, normaliz
         ('PCA', results_pca),
         ('VAE', results_vae)
     ]
+    
+    # Add importance results if provided
+    if results_importance is not None:
+        methods.append(('Importance', results_importance))
     
     # Collect distances (only from activation-based approach)
     for dist_type in distances:
@@ -2686,3 +2692,385 @@ def compare_activation_distances_dim(results_conv=None, results_embedding=None, 
         print(f"\n{dist_type}:")
         for section, value in distances[dist_type].items():
             print(f"{section}: {value:.3f}")
+
+
+def find_important_neurons_in_range(activations, start_idx, end_idx, n_neurons=None):
+    """
+    Find neuron importance scores based on variance and activity
+    
+    Parameters:
+    -----------
+    activations : numpy.ndarray
+        Array of shape [n_samples, n_features] containing activation values
+    start_idx : int
+        Start index of the range to analyze
+    end_idx : int
+        End index of the range to analyze
+    n_neurons : int, optional
+        Number of neurons to return. If None, returns scores for all neurons
+        
+    Returns:
+    --------
+    numpy.ndarray
+        Indices of neurons sorted by importance (most to least important)
+    numpy.ndarray
+        Importance scores for all neurons
+    """
+    # Extract the range we want to analyze
+    activations_subset = activations[:, start_idx:end_idx]
+    
+    # Calculate variance (activity spread)
+    variance_scores = np.var(activations_subset, axis=0)
+    
+    # Calculate mean absolute activation (activity magnitude)
+    magnitude_scores = np.mean(np.abs(activations_subset), axis=0)
+    
+    # Normalize scores
+    variance_norm = (variance_scores - variance_scores.min()) / (variance_scores.max() - variance_scores.min() + 1e-10)
+    magnitude_norm = (magnitude_scores - magnitude_scores.min()) / (magnitude_scores.max() - magnitude_scores.min() + 1e-10)
+    
+    # Combine scores
+    importance_scores = variance_norm + magnitude_norm
+    
+    # Sort neurons by importance (highest to lowest)
+    sorted_indices = np.argsort(importance_scores)[::-1]
+    
+    if n_neurons is not None:
+        sorted_indices = sorted_indices[:n_neurons]
+    
+    # Adjust indices to match original activation array
+    original_indices = sorted_indices + start_idx
+    
+    return original_indices, importance_scores
+
+def calculate_accuracy(model, loader, device='cuda'):
+    """
+    Calculate overall accuracy of the model on given data loader
+    
+    Parameters:
+    -----------
+    model : torch.nn.Module
+        The neural network model to evaluate
+    loader : DataLoader
+        DataLoader containing validation or test data
+    device : str, default='cuda'
+        Device to run evaluation on
+        
+    Returns:
+    --------
+    float
+        Accuracy as percentage (0-100)
+    """
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    
+    accuracy = 100. * correct / total
+    return accuracy
+
+def create_pruned_model(original_model, indices_to_zero, device='cuda'):
+    """
+    Create a copy of the model and zero out weights for specified neurons
+    
+    Parameters:
+    -----------
+    original_model : torch.nn.Module
+        The original neural network model
+    indices_to_zero : numpy.ndarray or list
+        Indices of neurons to zero out
+    device : str, default='cuda'
+        Device to place the model on
+        
+    Returns:
+    --------
+    torch.nn.Module
+        New model with zeroed weights at specified indices
+    """
+    # Create a deep copy of the model
+    pruned_model = copy.deepcopy(original_model)
+    pruned_model = pruned_model.to(device)
+    
+    # Set model to eval mode
+    pruned_model.eval()
+    
+    # Get the layers of the model
+    layers = list(pruned_model.model)
+    
+    # Find all Linear layers
+    linear_layers = [(i, layer) for i, layer in enumerate(layers) 
+                    if isinstance(layer, nn.Linear)]
+    
+    # For each specified index, zero out the corresponding weights and bias
+    for idx in indices_to_zero:
+        # Calculate which layer this neuron belongs to
+        current_pos = 0
+        for layer_idx, layer in linear_layers:
+            output_size = layer.out_features
+            
+            # Check if the index falls within this layer's outputs
+            if current_pos <= idx < current_pos + output_size:
+                # Calculate the relative position within this layer
+                relative_idx = idx - current_pos
+                
+                # Zero out weights and bias for this neuron
+                layer.weight.data[relative_idx].zero_()
+                if layer.bias is not None:
+                    layer.bias.data[relative_idx] = 0
+                break
+                
+            current_pos += output_size
+    
+    return pruned_model
+
+def split_activations_by_class(activations, labels):
+    """
+    Split activation data by class label
+    
+    Parameters:
+    -----------
+    activations : numpy.ndarray
+        Array of activations with shape [n_samples, n_features]
+    labels : numpy.ndarray
+        Array of class labels with shape [n_samples]
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing activations for each class
+        {class_label: class_activations_array}
+    """
+    # Initialize dictionary to store class-specific activations
+    class_activations = {}
+    
+    # Get unique classes
+    unique_classes = np.unique(labels)
+    
+    # Split activations by class
+    for class_label in unique_classes:
+        # Create mask for current class
+        class_mask = labels == class_label
+        # Store activations for current class
+        class_activations[class_label] = activations[class_mask]
+    
+    return class_activations
+
+def evaluate_per_class(model, test_loader, device='cuda'):
+    """
+    Evaluate model accuracy for each MNIST digit class
+    
+    Parameters:
+    -----------
+    model : torch.nn.Module
+        The trained model to evaluate
+    test_loader : DataLoader
+        DataLoader containing test data
+    device : str, default='cuda'
+        Device to run evaluation on
+        
+    Returns:
+    --------
+    dict
+        Dictionary containing per-class accuracies
+    """
+    model.eval()
+    # Initialize counters for each class
+    class_correct = {i: 0 for i in range(10)}
+    class_total = {i: 0 for i in range(10)}
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = outputs.max(1)
+            
+            # Update counters for each class
+            for label, pred in zip(labels, predicted):
+                if label == pred:
+                    class_correct[label.item()] += 1
+                class_total[label.item()] += 1
+    
+    # Calculate and print accuracy for each class
+    print("\nAccuracy per class:")
+    for i in range(10):
+        accuracy = 100 * class_correct[i] / class_total[i]
+        print(f"Digit {i}: {accuracy:.2f}% ({class_correct[i]}/{class_total[i]})")
+    
+    return {i: 100 * class_correct[i] / class_total[i] for i in range(10)}
+
+def evaluate_pruning_strategies(model, test_loader, activations, num_steps=20, max_neurons=256, device='cuda', seed=42):
+    """
+    Compare pruning based on importance vs random selection
+    """
+    np.random.seed(seed)
+    total_neurons = activations.shape[1]
+    neurons_per_step = max_neurons // num_steps
+    
+    results = {
+        'importance_based': {'neurons': [], 'accuracy': []},
+        'random': {'neurons': [], 'accuracy': []}
+    }
+    
+    # Get importance-based ordering of all neurons
+    indices, scores = find_important_neurons_in_range(
+        activations=activations,
+        start_idx=0,
+        end_idx=total_neurons
+    )
+    
+    # Indices are already sorted from most to least important
+    importance_order = indices
+    
+    # Create random ordering
+    random_order = np.random.permutation(total_neurons)
+    
+    # Store baseline accuracy
+    baseline_acc = calculate_accuracy(model, test_loader, device)
+    results['importance_based']['neurons'].append(0)
+    results['importance_based']['accuracy'].append(baseline_acc)
+    results['random']['neurons'].append(0)
+    results['random']['accuracy'].append(baseline_acc)
+    
+    # Evaluate progressively larger sets of pruned neurons
+    for i in range(num_steps):
+        n_neurons = (i + 1) * neurons_per_step
+        
+        # Importance-based pruning (prune least important neurons)
+        neurons_to_prune = importance_order[-n_neurons:]
+        pruned_model = create_pruned_model(model, neurons_to_prune, device)
+        importance_acc = calculate_accuracy(pruned_model, test_loader, device)
+        
+        # Random pruning
+        random_neurons = random_order[:n_neurons]
+        random_pruned_model = create_pruned_model(model, random_neurons, device)
+        random_acc = calculate_accuracy(random_pruned_model, test_loader, device)
+        
+        # Store results
+        results['importance_based']['neurons'].append(n_neurons)
+        results['importance_based']['accuracy'].append(importance_acc)
+        results['random']['neurons'].append(n_neurons)
+        results['random']['accuracy'].append(random_acc)
+        
+        print(f"Pruned {n_neurons} neurons:")
+        print(f"  Importance-based accuracy: {importance_acc:.2f}%")
+        print(f"  Random pruning accuracy: {random_acc:.2f}%")
+    
+    return results
+
+def plot_pruning_comparison(results):
+    """
+    Plot comparison of pruning strategies
+    
+    Parameters:
+    -----------
+    results : dict
+        Results from evaluate_pruning_strategies
+    """
+    plt.figure(figsize=(10, 6))
+    
+    # Plot both strategies
+    plt.plot(results['importance_based']['neurons'], 
+             results['importance_based']['accuracy'], 
+             'b-', label='Importance-based pruning')
+    plt.plot(results['random']['neurons'], 
+             results['random']['accuracy'], 
+             'r--', label='Random pruning')
+    
+    plt.xlabel('Number of Pruned Neurons')
+    plt.ylabel('Model Accuracy (%)')
+    plt.title('Comparison of Pruning Strategies')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Add vertical lines at specific accuracy drops
+    baseline = results['importance_based']['accuracy'][0]
+    thresholds = [0.99, 0.95, 0.90]
+    colors = ['g', 'y', 'r']
+    
+    for threshold, color in zip(thresholds, colors):
+        threshold_acc = baseline * threshold
+        
+        # Find crossing points for both strategies
+        for strategy in ['importance_based', 'random']:
+            accuracies = np.array(results[strategy]['accuracy'])
+            neurons = np.array(results[strategy]['neurons'])
+            
+            # Find where accuracy drops below threshold
+            if any(accuracies < threshold_acc):
+                idx = np.where(accuracies < threshold_acc)[0][0]
+                plt.axvline(x=neurons[idx], color=color, alpha=0.3, linestyle=':')
+                plt.text(neurons[idx], plt.ylim()[0], 
+                        f'{int(threshold*100)}%\n{neurons[idx]}n',
+                        rotation=90, verticalalignment='bottom')
+    
+    plt.tight_layout()
+    plt.show()
+
+def compare_pruning_strategies(model, test_loader, important_indices, device='cuda'):
+    """
+    Compare pruning using important neurons vs random neurons
+    
+    Parameters:
+    -----------
+    model : torch.nn.Module
+        The neural network model
+    test_loader : DataLoader
+        Test data loader
+    important_indices : list or numpy.ndarray
+        List of neuron indices sorted by importance (most to least important)
+    device : str, default='cuda'
+        Device to run evaluation on
+    """
+    n_neurons = len(important_indices)
+    
+    # Create random indices
+    random_indices = np.random.randint(0, 512, size=len(important_indices))
+
+    
+    # Initialize results
+    results = {
+        'n_pruned': [0],  # Start with 0 pruned neurons
+        'importance_acc': [calculate_accuracy(model, test_loader, device)],  # Baseline accuracy
+        'random_acc': [calculate_accuracy(model, test_loader, device)]  # Baseline accuracy
+    }
+    
+    # Evaluate progressively larger sets of pruned neurons
+    for i in range(n_neurons):
+        # Importance-based pruning (prune least important first)
+        importance_neurons = important_indices[-(i+1):]  # Take last n neurons
+        pruned_model = create_pruned_model(model, importance_neurons, device)
+        importance_acc = calculate_accuracy(pruned_model, test_loader, device)
+        
+        # Random pruning
+        random_neurons = random_indices[:i+1]  # Take first n neurons
+        random_model = create_pruned_model(model, random_neurons, device)
+        random_acc = calculate_accuracy(random_model, test_loader, device)
+        
+        # Store results
+        results['n_pruned'].append(i+1)
+        results['importance_acc'].append(importance_acc)
+        results['random_acc'].append(random_acc)
+        
+        print(f"Pruned {i+1}/{n_neurons} neurons:")
+        print(f"  Importance-based accuracy: {importance_acc:.2f}%")
+        print(f"  Random pruning accuracy: {random_acc:.2f}%")
+    
+    # Plot results
+    plt.figure(figsize=(10, 6))
+    plt.plot(results['n_pruned'], results['importance_acc'], 'b-', label='Importance-based pruning')
+    plt.plot(results['n_pruned'], results['random_acc'], 'r--', label='Random pruning')
+    plt.xlabel('Number of Pruned Neurons')
+    plt.ylabel('Model Accuracy (%)')
+    plt.title('Comparison of Pruning Strategies')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    return results
